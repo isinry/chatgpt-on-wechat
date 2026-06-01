@@ -231,6 +231,7 @@ def _clear_singleton_cache(channel_name: str):
         "wechatmp": "channel.wechatmp.wechatmp_channel.WechatMPChannel",
         "wechatmp_service": "channel.wechatmp.wechatmp_channel.WechatMPChannel",
         "wechatcom_app": "channel.wechatcom.wechatcomapp_channel.WechatComAppChannel",
+        const.WECHAT_KF: "channel.wechat_kf.wechat_kf_channel.WechatKfChannel",
         const.FEISHU: "channel.feishu.feishu_channel.FeiShuChanel",
         const.DINGTALK: "channel.dingtalk.dingtalk_channel.DingTalkChanel",
         const.WECOM_BOT: "channel.wecom_bot.wecom_bot_channel.WecomBotChannel",
@@ -274,6 +275,63 @@ def sigterm_handler_wrap(_signo):
     signal.signal(_signo, func)
 
 
+def _warmup_mcp_tools():
+    """
+    Kick off MCP server loading at process startup so subprocesses
+    (npx / uvx etc.) finish initializing before the first user message
+    arrives. Returns immediately — the actual work happens on a daemon
+    thread inside ToolManager. Safe to call when MCP is not configured.
+    """
+    try:
+        from agent.tools import ToolManager
+        ToolManager()._load_mcp_tools()
+    except Exception as e:
+        logger.warning(f"[App] MCP warmup failed (non-fatal): {e}")
+
+
+def _warmup_scheduler():
+    """Eager-init AgentBridge so the scheduler thread starts at process
+    boot rather than waiting for the first user message."""
+    try:
+        from bridge.bridge import Bridge
+        Bridge().get_agent_bridge()
+    except Exception as e:
+        logger.warning(f"[App] Scheduler warmup failed: {e}")
+
+
+def _sync_builtin_skills():
+    """Sync builtin skills from project skills/ to workspace skills/ on startup."""
+    import shutil
+    try:
+        workspace = conf().get("agent_workspace", "~/cow")
+        workspace = os.path.expanduser(workspace)
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        builtin_dir = os.path.join(project_root, "skills")
+        custom_dir = os.path.join(workspace, "skills")
+
+        if not os.path.isdir(builtin_dir):
+            return
+
+        os.makedirs(custom_dir, exist_ok=True)
+        synced = 0
+        for name in os.listdir(builtin_dir):
+            src = os.path.join(builtin_dir, name)
+            if not os.path.isdir(src) or not os.path.isfile(os.path.join(src, "SKILL.md")):
+                continue
+            dst = os.path.join(custom_dir, name)
+            try:
+                if os.path.isdir(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+                synced += 1
+            except Exception as e:
+                logger.warning(f"[App] Failed to sync builtin skill '{name}': {e}")
+        if synced:
+            logger.info(f"[App] Synced {synced} builtin skill(s) to workspace")
+    except Exception as e:
+        logger.warning(f"[App] Builtin skills sync failed: {e}")
+
+
 def run():
     global _channel_mgr
     try:
@@ -299,6 +357,15 @@ def run():
         if web_console_enabled and "web" not in channel_names:
             channel_names.append("web")
 
+        # Sync builtin skills to workspace before channels start
+        _sync_builtin_skills()
+
+        # Kick off MCP server loading in the background so first-message
+        # latency isn't dominated by npx package downloads.
+        _warmup_mcp_tools()
+
+        _warmup_scheduler()
+
         logger.info(f"[App] Starting channels: {channel_names}")
 
         _channel_mgr = ChannelManager()
@@ -306,6 +373,8 @@ def run():
 
         while True:
             time.sleep(1)
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
         logger.error("App startup failed!")
         logger.exception(e)

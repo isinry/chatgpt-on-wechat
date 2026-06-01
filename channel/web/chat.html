@@ -5,20 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CowAgent Console</title>
     <link rel="icon" href="assets/favicon.ico" type="image/x-icon">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/markdown-it@13.0.1/dist/markdown-it.min.js"></script>
-    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
-    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" disabled>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/javascript.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/go.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+    <!-- Vendored third-party assets (no external CDN dependency).
+         See channel/web/static/vendor/README.md for sources & versions. -->
+    <link rel="stylesheet" href="assets/vendor/fontawesome/css/all.min.css">
+    <link rel="stylesheet" href="assets/vendor/fonts/inter/inter.css">
+    <script src="assets/vendor/tailwind/tailwind.min.js"></script>
+    <script src="assets/vendor/markdown-it/markdown-it.min.js"></script>
+    <link id="hljs-light" rel="stylesheet" href="assets/vendor/highlightjs/styles/github.min.css">
+    <link id="hljs-dark" rel="stylesheet" href="assets/vendor/highlightjs/styles/github-dark.min.css" disabled>
+    <script src="assets/vendor/highlightjs/highlight.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/python.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/javascript.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/java.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/go.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/bash.min.js"></script>
     <script>
     tailwind.config = {
         darkMode: 'class',
@@ -47,11 +47,30 @@
          This runs synchronously in <head> so the correct class is on <html>
          before any CSS or body rendering occurs. -->
     <script>
+    // Map an arbitrary locale string (zh-CN, en-US, fr ...) to 'zh' / 'en',
+    // or '' when unrecognized so callers can fall through to the next source.
+    window.__cowNormalizeLang__ = function(raw) {
+        if (!raw) return '';
+        var v = String(raw).trim().toLowerCase();
+        if (v === 'auto') return '';
+        if (v.indexOf('zh') === 0) return 'zh';
+        if (v.indexOf('en') === 0) return 'en';
+        return '';
+    };
+    // Resolve the console language by priority:
+    //   user choice (localStorage) -> backend-detected -> browser -> 'zh'.
+    window.__cowResolveLang__ = function() {
+        return window.__cowNormalizeLang__(localStorage.getItem('cow_lang'))
+            || window.__cowNormalizeLang__(window.__COW_DEFAULT_LANG__)
+            || window.__cowNormalizeLang__(navigator.language || (navigator.languages && navigator.languages[0]))
+            || 'zh';
+    };
     (function() {
+        // Backend-resolved default language (from cow_lang config / auto-detect).
+        window.__COW_DEFAULT_LANG__ = '{{COW_DEFAULT_LANG}}';
         var theme = localStorage.getItem('cow_theme') || 'dark';
         if (theme === 'dark') document.documentElement.classList.add('dark');
-        var lang = localStorage.getItem('cow_lang') || 'zh';
-        document.documentElement.setAttribute('lang', lang);
+        document.documentElement.setAttribute('lang', window.__cowResolveLang__());
     })();
     </script>
 </head>
@@ -136,6 +155,11 @@
                            data-view="config">
                             <i class="fas fa-sliders item-icon text-xs w-5 text-center"></i>
                             <span data-i18n="menu_config">配置</span>
+                        </a>
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="models">
+                            <i class="fas fa-microchip item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_models">模型</span>
                         </a>
                         <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
                            data-view="skills">
@@ -288,7 +312,7 @@
                 <!-- ====================================================== -->
                 <!-- VIEW: Chat                                              -->
                 <!-- ====================================================== -->
-                <div id="view-chat" class="view active">
+                <div id="view-chat" class="view active relative">
                     <!-- Messages -->
                     <div id="chat-messages" class="flex-1 overflow-y-auto">
                         <!-- Welcome Screen -->
@@ -364,6 +388,18 @@
                         </div>
                     </div>
 
+                    <!-- Scroll-to-bottom FAB -->
+                    <button id="scroll-to-bottom-btn"
+                            class="hidden absolute right-5 bottom-[80px] z-10
+                                   w-9 h-9 rounded-full shadow-lg
+                                   bg-white dark:bg-[#2A2A2A] border border-slate-200 dark:border-white/15
+                                   text-slate-500 dark:text-slate-400 hover:text-primary-500 dark:hover:text-primary-400
+                                   flex items-center justify-center cursor-pointer transition-all duration-200
+                                   hover:shadow-xl hover:scale-105"
+                            onclick="_autoScrollEnabled = true; scrollChatToBottom(true);">
+                        <i class="fas fa-chevron-down text-sm"></i>
+                    </button>
+
                     <!-- Chat Input -->
                     <div class="flex-shrink-0 border-t border-slate-200 dark:border-white/10 bg-white dark:bg-[#1A1A1A] px-4 py-3">
                         <div class="max-w-3xl mx-auto">
@@ -386,28 +422,49 @@
                                     <button id="attach-btn" class="w-9 h-10 flex items-center justify-center rounded-lg
                                                                    text-slate-400 hover:text-primary-500 hover:bg-primary-50 dark:hover:bg-primary-900/20
                                                                    cursor-pointer transition-colors duration-150"
-                                            onclick="document.getElementById('file-input').click()">
+                                            type="button"
+                                            onclick="toggleAttachMenu(event)">
                                         <i class="fas fa-paperclip text-base"></i>
                                     </button>
                                 </div>
                                 <input type="file" id="file-input" class="hidden" multiple
                                        accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.json,.xml,.zip,.rar,.7z,.py,.js,.ts,.java,.c,.cpp,.go,.rs,.md">
+                                <input type="file" id="folder-input" class="hidden" multiple webkitdirectory directory>
+                                <div id="attach-menu" class="attach-menu hidden">
+                                    <button id="attach-file-option" type="button" class="attach-menu-item" onclick="triggerFileUpload()">
+                                        <i class="fas fa-file-arrow-up"></i>
+                                        <span data-i18n="attach_menu_file">上传文件</span>
+                                    </button>
+                                    <button id="attach-folder-option" type="button" class="attach-menu-item" onclick="triggerFolderUpload()">
+                                        <i class="fas fa-folder-plus"></i>
+                                        <span data-i18n="attach_menu_folder">上传文件夹</span>
+                                    </button>
+                                </div>
                                 <div id="slash-menu" class="slash-menu hidden"></div>
-                                <textarea id="chat-input"
-                                          class="flex-1 min-w-0 px-4 py-[10px] rounded-xl border border-slate-200 dark:border-slate-600
-                                                 bg-slate-50 dark:bg-white/5 text-slate-800 dark:text-slate-100
-                                                 placeholder:text-slate-400 dark:placeholder:text-slate-500
-                                                 focus:outline-none focus:ring-0 focus:border-primary-600
-                                                 text-sm leading-relaxed"
-                                          rows="1"
-                                          data-i18n-placeholder="input_placeholder"
-                                          placeholder="输入消息，或输入 / 使用指令"></textarea>
+                                <div class="flex-1 min-w-0 relative flex items-center">
+                                    <textarea id="chat-input"
+                                              class="w-full pl-4 pr-11 py-[10px] rounded-xl border border-slate-200 dark:border-slate-600
+                                                     bg-slate-50 dark:bg-white/5 text-slate-800 dark:text-slate-100
+                                                     placeholder:text-slate-400 dark:placeholder:text-slate-500
+                                                     focus:outline-none focus:ring-0 focus:border-primary-600
+                                                     text-sm leading-relaxed"
+                                              rows="1"
+                                              data-i18n-placeholder="input_placeholder"
+                                              placeholder="输入消息，或输入 / 使用指令"></textarea>
+                                    <button id="mic-btn" type="button"
+                                            class="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 flex items-center justify-center rounded-lg
+                                                   text-slate-400 hover:text-primary-500 hover:bg-primary-50 dark:hover:bg-primary-900/20
+                                                   cursor-pointer transition-colors duration-150"
+                                            data-i18n-title="mic_idle_title" title="点击录音 / 再按一次结束">
+                                        <i class="fas fa-microphone text-sm"></i>
+                                    </button>
+                                </div>
                                 <button id="send-btn"
                                         class="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-lg
                                                bg-primary-400 text-white hover:bg-primary-500
                                                disabled:bg-slate-300 dark:disabled:bg-slate-600
                                                disabled:cursor-not-allowed cursor-pointer transition-colors duration-150"
-                                        disabled onclick="sendMessage()">
+                                        disabled>
                                     <i class="fas fa-paper-plane text-sm"></i>
                                 </button>
                             </div>
@@ -436,6 +493,11 @@
                                             <i class="fas fa-microchip text-primary-500 text-sm"></i>
                                         </div>
                                         <h3 class="font-semibold text-slate-800 dark:text-slate-100" data-i18n="config_model">模型配置</h3>
+                                        <a class="ml-auto text-xs text-slate-500 dark:text-slate-400 hover:text-primary-500 dark:hover:text-primary-400 cursor-pointer transition-colors flex items-center gap-1"
+                                           onclick="navigateTo('models')">
+                                            <span data-i18n="config_model_advanced">高级配置</span>
+                                            <i class="fas fa-arrow-right text-[10px]"></i>
+                                        </a>
                                     </div>
                                     <div class="space-y-5">
                                         <!-- Provider -->
@@ -552,7 +614,7 @@
                                                 <span class="cfg-tip" data-tip-key="config_enable_thinking_hint"><i class="fas fa-circle-question"></i></span>
                                             </label>
                                             <label class="relative inline-flex items-center cursor-pointer">
-                                                <input id="cfg-enable-thinking" type="checkbox" class="sr-only peer" checked>
+                                                <input id="cfg-enable-thinking" type="checkbox" class="sr-only peer">
                                                 <div class="w-9 h-5 bg-slate-200 dark:bg-slate-700 peer-checked:bg-primary-400 rounded-full
                                                             after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white
                                                             after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
@@ -593,6 +655,31 @@
                                                     class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
                                                            cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
                                                     onclick="savePasswordConfig()" data-i18n="config_save">保存</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Language Config Card -->
+                                <div class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 p-6">
+                                    <div class="flex items-center gap-3 mb-5">
+                                        <div class="w-9 h-9 rounded-lg bg-sky-50 dark:bg-sky-900/30 flex items-center justify-center">
+                                            <i class="fas fa-language text-sky-500 text-sm"></i>
+                                        </div>
+                                        <h3 class="font-semibold text-slate-800 dark:text-slate-100" data-i18n="config_language">语言</h3>
+                                    </div>
+                                    <div class="space-y-4">
+                                        <div>
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                                <span data-i18n="config_language">语言</span>
+                                                <span class="cfg-tip" data-tip-key="config_language_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <div id="cfg-lang-select" class="cfg-dropdown" tabindex="0">
+                                                <div class="cfg-dropdown-selected">
+                                                    <span class="cfg-dropdown-text">--</span>
+                                                    <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                                                </div>
+                                                <div class="cfg-dropdown-menu"></div>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -827,6 +914,41 @@
                 </div>
 
                 <!-- ====================================================== -->
+                <!-- VIEW: Models                                            -->
+                <!-- ====================================================== -->
+                <div id="view-models" class="view">
+                    <!-- Tailwind JIT safelist: capability-card icon colors are
+                         emitted from JS template strings. Listing them here
+                         (display:none) guarantees the CDN-side compiler picks
+                         them up regardless of render timing. -->
+                    <div class="hidden bg-blue-50 dark:bg-blue-900/30 text-blue-500
+                                       bg-orange-50 dark:bg-orange-900/30 text-orange-500
+                                       bg-purple-50 dark:bg-purple-900/30 text-purple-500
+                                       bg-amber-50 dark:bg-amber-900/30 text-amber-500
+                                       bg-primary-50 dark:bg-primary-900/30 text-primary-500"></div>
+                    <div class="flex-1 overflow-y-auto p-6">
+                        <div class="max-w-4xl mx-auto">
+                            <div class="flex items-center justify-between mb-6">
+                                <div>
+                                    <h2 class="text-xl font-bold text-slate-800 dark:text-slate-100" data-i18n="models_title">模型管理</h2>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 mt-1" data-i18n="models_desc">统一管理对话、视觉、语音、向量、图像、搜索能力</p>
+                                </div>
+                                <button id="models-add-vendor-btn" onclick="openVendorModal('')"
+                                        class="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600
+                                               text-white text-sm font-medium cursor-pointer transition-colors duration-150">
+                                    <i class="fas fa-plus text-xs"></i>
+                                    <span data-i18n="models_add_vendor">添加厂商</span>
+                                </button>
+                            </div>
+                            <div id="models-loading" class="flex items-center gap-2 py-12 justify-center text-slate-400 dark:text-slate-500 text-sm">
+                                <i class="fas fa-spinner fa-spin text-xs"></i><span>Loading...</span>
+                            </div>
+                            <div id="models-content" class="grid gap-6 hidden"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ====================================================== -->
                 <!-- VIEW: Channels                                          -->
                 <!-- ====================================================== -->
                 <div id="view-channels" class="view">
@@ -895,6 +1017,28 @@
                                     </div>
                                     <span class="text-xs text-slate-400 ml-2 font-mono">run.log</span>
                                     <div class="flex-1"></div>
+                                    <div class="flex items-center gap-3 mr-2">
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="debug" checked>
+                                            <span class="text-xs text-slate-400">DEBUG</span>
+                                        </label>
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="info" checked>
+                                            <span class="text-xs text-blue-400">INFO</span>
+                                        </label>
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="warning" checked>
+                                            <span class="text-xs text-yellow-400">WARNING</span>
+                                        </label>
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="error" checked>
+                                            <span class="text-xs text-red-400">ERROR</span>
+                                        </label>
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="critical" checked>
+                                            <span class="text-xs text-white font-bold">CRITICAL</span>
+                                        </label>
+                                    </div>
                                     <div class="flex items-center gap-1.5">
                                         <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
                                         <span class="text-xs text-slate-500" data-i18n="logs_live">实时</span>
@@ -913,7 +1057,7 @@
     </div><!-- /app -->
 
     <!-- Confirm Dialog -->
-    <div id="confirm-dialog-overlay" class="fixed inset-0 bg-black/50 z-[100] hidden flex items-center justify-center">
+    <div id="confirm-dialog-overlay" class="fixed inset-0 bg-black/50 z-[200] hidden flex items-center justify-center">
         <div class="bg-white dark:bg-[#1A1A1A] rounded-2xl border border-slate-200 dark:border-white/10 shadow-xl
                     w-full max-w-sm mx-4 overflow-hidden">
             <div class="p-6">
@@ -938,7 +1082,77 @@
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
-    <script src="assets/js/console.js"></script>
+    <!-- Vendor Credentials Modal -->
+    <div id="vendor-modal-overlay" class="fixed inset-0 bg-black/50 z-[100] hidden flex items-center justify-center">
+        <div class="bg-white dark:bg-[#1A1A1A] rounded-2xl border border-slate-200 dark:border-white/10 shadow-xl
+                    w-full max-w-md mx-4">
+            <div class="p-6">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-primary-50 dark:bg-primary-900/20 flex items-center justify-center flex-shrink-0">
+                        <i class="fas fa-key text-primary-500"></i>
+                    </div>
+                    <div class="min-w-0 flex-1">
+                        <h3 id="vendor-modal-title" class="font-semibold text-slate-800 dark:text-slate-100 text-base"></h3>
+                        <p id="vendor-modal-subtitle" class="text-xs text-slate-500 dark:text-slate-400 mt-0.5 font-mono"></p>
+                    </div>
+                </div>
+
+                <!-- Provider selector (only visible when adding via top button) -->
+                <div id="vendor-modal-picker-wrap" class="mb-4 hidden">
+                    <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5" data-i18n="models_provider">厂商</label>
+                    <div id="vendor-modal-picker" class="cfg-dropdown" tabindex="0">
+                        <div class="cfg-dropdown-selected">
+                            <span class="cfg-dropdown-text">--</span>
+                            <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                        </div>
+                        <div class="cfg-dropdown-menu"></div>
+                    </div>
+                </div>
+
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">API Key</label>
+                        <input id="vendor-modal-key" type="text" autocomplete="off" data-1p-ignore data-lpignore="true"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                      bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                      focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                               placeholder="sk-...">
+                    </div>
+                    <div id="vendor-modal-base-wrap">
+                        <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">API Base</label>
+                        <input id="vendor-modal-base" type="text"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                      bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                      focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                               placeholder="https://...../v1">
+                        <p id="vendor-modal-base-hint" class="mt-1.5 text-xs text-slate-400 dark:text-slate-500 hidden">
+                            <i class="fas fa-info-circle mr-1"></i><span data-i18n="models_base_default_hint">留空将使用官方默认地址</span>
+                        </p>
+                    </div>
+                </div>
+            </div>
+            <div class="flex items-center justify-between gap-3 px-6 py-4 border-t border-slate-100 dark:border-white/5 rounded-b-2xl">
+                <button id="vendor-modal-clear"
+                        class="px-3 py-2 rounded-lg text-xs
+                               text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20
+                               cursor-pointer transition-colors duration-150 hidden"
+                        data-i18n="models_clear_credential">清除凭据</button>
+                <span id="vendor-modal-status"
+                      class="flex-1 text-xs text-primary-500 opacity-0 transition-opacity duration-300 text-center"></span>
+                <button id="vendor-modal-cancel"
+                        class="px-4 py-2 rounded-lg border border-slate-200 dark:border-white/10
+                               text-slate-600 dark:text-slate-300 text-sm font-medium
+                               hover:bg-slate-50 dark:hover:bg-white/5
+                               cursor-pointer transition-colors duration-150"
+                        data-i18n="cancel">取消</button>
+                <button id="vendor-modal-save"
+                        class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
+                               cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                        data-i18n="save">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <script defer src="assets/js/console.js"></script>
 </body>
 </html>

@@ -34,8 +34,54 @@ HEARTBEAT_INTERVAL = 30
 MEDIA_CHUNK_SIZE = 512 * 1024  # 512KB per chunk (before base64 encoding)
 
 
+def _escape_control_chars_inside_json_strings(s: str) -> str:
+    """Escape U+0000–U+001F inside JSON string values so json.loads accepts WeCom payloads.
+
+    The server occasionally emits raw newlines/tabs inside quoted fields, which is
+    invalid strict JSON but recoverable without touching escapes like \\n or \\".
+    """
+    out = []
+    in_string = False
+    escape = False
+    for c in s:
+        if escape:
+            out.append(c)
+            escape = False
+            continue
+        if in_string and c == "\\":
+            out.append(c)
+            escape = True
+            continue
+        if c == '"':
+            out.append(c)
+            in_string = not in_string
+            continue
+        if in_string and ord(c) < 32:
+            out.append("\\u%04x" % ord(c))
+            continue
+        out.append(c)
+    return "".join(out)
+
+
+def _loads_wecom_ws_json(raw):
+    """Parse WebSocket JSON; tolerate unescaped control characters inside strings."""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if not isinstance(raw, str):
+        raw = str(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        msg = str(e).lower()
+        if "control character" in msg:
+            return json.loads(_escape_control_chars_inside_json_strings(raw))
+        raise
+
+
 @singleton
 class WecomBotChannel(ChatChannel):
+
+    NOT_SUPPORT_REPLYTYPE = []
 
     def __init__(self):
         super().__init__()
@@ -93,7 +139,7 @@ class WecomBotChannel(ChatChannel):
 
         def _on_message(ws, raw):
             try:
-                data = json.loads(raw)
+                data = _loads_wecom_ws_json(raw)
                 self._handle_ws_message(data)
             except Exception as e:
                 logger.error(f"[WecomBot] Failed to handle ws message: {e}", exc_info=True)
@@ -394,6 +440,17 @@ class WecomBotChannel(ChatChannel):
                     state["current"] = ""
                 _push_stream(state, force=True)
 
+            elif event_type == "agent_cancelled":
+                # Flush partial output and strip trailing "---" separator
+                # left over from previous turn, to avoid a dangling divider.
+                if state["current"]:
+                    state["committed"] += state["current"]
+                    state["current"] = ""
+                state["committed"] = state["committed"].rstrip()
+                if state["committed"].endswith("---"):
+                    state["committed"] = state["committed"][:-3].rstrip()
+                _push_stream(state, force=True)
+
         return on_event
 
     # ------------------------------------------------------------------
@@ -428,6 +485,8 @@ class WecomBotChannel(ChatChannel):
             else:
                 context.type = ContextType.TEXT
             context.content = content.strip()
+            if "desire_rtype" not in context and conf().get("always_reply_voice"):
+                context["desire_rtype"] = ReplyType.VOICE
 
         return context
 
@@ -454,6 +513,8 @@ class WecomBotChannel(ChatChannel):
             self._send_file(reply.content, receiver, is_group, req_id)
         elif reply.type == ReplyType.VIDEO or reply.type == ReplyType.VIDEO_URL:
             self._send_file(reply.content, receiver, is_group, req_id, media_type="video")
+        elif reply.type == ReplyType.VOICE:
+            self._send_voice(reply.content, receiver, is_group, req_id)
         else:
             logger.warning(f"[WecomBot] Unsupported reply type: {reply.type}, falling back to text")
             self._send_text(str(reply.content), receiver, is_group, req_id)
@@ -683,6 +744,65 @@ class WecomBotChannel(ChatChannel):
                     "chat_type": 2 if is_group else 1,
                     "msgtype": media_type,
                     media_type: {"media_id": media_id},
+                },
+            })
+
+    def _send_voice(self, voice_path: str, receiver: str, is_group: bool, req_id: str = None):
+        """Send native voice reply. WeCom voice media must be amr."""
+        local_path = voice_path
+        if local_path.startswith("file://"):
+            local_path = local_path[7:]
+
+        if local_path.startswith(("http://", "https://")):
+            try:
+                resp = requests.get(local_path, timeout=60)
+                resp.raise_for_status()
+                ext = os.path.splitext(local_path)[1] or ".mp3"
+                tmp_path = f"/tmp/wecom_voice_{uuid.uuid4().hex[:8]}{ext}"
+                with open(tmp_path, "wb") as f:
+                    f.write(resp.content)
+                local_path = tmp_path
+            except Exception as e:
+                logger.error(f"[WecomBot] Failed to download voice for sending: {e}")
+                return
+
+        if not os.path.exists(local_path):
+            logger.error(f"[WecomBot] Voice file not found: {local_path}")
+            return
+
+        amr_path = local_path
+        if not local_path.lower().endswith(".amr"):
+            try:
+                from voice.audio_convert import any_to_amr
+                amr_path = os.path.splitext(local_path)[0] + ".amr"
+                any_to_amr(local_path, amr_path)
+            except Exception as e:
+                logger.error(f"[WecomBot] Failed to convert voice to amr: {e}")
+                return
+
+        media_id = self._upload_media(amr_path, "voice")
+        if not media_id:
+            logger.error("[WecomBot] Failed to upload voice media")
+            return
+
+        if req_id:
+            self._ws_send({
+                "cmd": "aibot_respond_msg",
+                "headers": {"req_id": req_id},
+                "body": {
+                    "msgtype": "voice",
+                    "voice": {"media_id": media_id},
+                },
+            })
+        else:
+            self._ws_send({
+                "cmd": "aibot_send_msg",
+                "headers": {"req_id": self._gen_req_id()},
+                "body": {
+                    "chatid": receiver,
+                    "chat_type": 2 if is_group else 1,
+                    "msgtype": "voice",
+                    "voice": {"media_id": media_id},
                 },
             })
 

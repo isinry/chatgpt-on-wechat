@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role         TEXT    NOT NULL,
     content      TEXT    NOT NULL,
     created_at   INTEGER NOT NULL,
+    extras       TEXT    NOT NULL DEFAULT '',
     UNIQUE (session_id, seq)
 );
 
@@ -65,6 +66,12 @@ ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT '';
 
 _MIGRATION_ADD_CONTEXT_START_SEQ = """
 ALTER TABLE sessions ADD COLUMN context_start_seq INTEGER NOT NULL DEFAULT 0;
+"""
+
+# Generic JSON sidecar for per-message attachments (TTS audio URL, future use).
+# Always optional — readers must tolerate missing column / empty / invalid JSON.
+_MIGRATION_ADD_MSG_EXTRAS = """
+ALTER TABLE messages ADD COLUMN extras TEXT NOT NULL DEFAULT '';
 """
 
 DEFAULT_MAX_AGE_DAYS: int = 30
@@ -116,9 +123,10 @@ def _extract_tool_calls(content: Any) -> List[Dict[str, Any]]:
     ]
 
 
-def _extract_tool_results(content: Any) -> Dict[str, str]:
+def _extract_tool_results(content: Any) -> Dict[str, dict]:
     """
     Extract tool_result blocks from a user message, keyed by tool_use_id.
+    Values are {"result": str, "is_error": bool}.
     """
     if not isinstance(content, list):
         return {}
@@ -133,12 +141,13 @@ def _extract_tool_results(content: Any) -> Dict[str, str]:
                 rb.get("text", "") for rb in result_content
                 if isinstance(rb, dict) and rb.get("type") == "text"
             )
-        results[tool_id] = str(result_content)
+        results[tool_id] = {"result": str(result_content), "is_error": bool(b.get("is_error", False))}
     return results
 
 
 def _group_into_display_turns(
     rows: List[tuple],
+    include_thinking: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Convert raw (role, content_json, created_at) DB rows into display turns.
@@ -167,20 +176,26 @@ def _group_into_display_turns(
     cur_rest: List[tuple] = []
     started = False
 
-    for role, raw_content, created_at in rows:
+    for role, raw_content, created_at, raw_extras in rows:
         try:
             content = json.loads(raw_content)
         except Exception:
             content = raw_content
+        try:
+            extras = json.loads(raw_extras) if raw_extras else {}
+            if not isinstance(extras, dict):
+                extras = {}
+        except Exception:
+            extras = {}
 
         if role == "user" and _is_visible_user_message(content):
             if started:
                 groups.append((cur_user, cur_rest))
-            cur_user = (content, created_at)
+            cur_user = (content, created_at, extras)
             cur_rest = []
             started = True
         else:
-            cur_rest.append((role, content, created_at))
+            cur_rest.append((role, content, created_at, extras))
 
     if started:
         groups.append((cur_user, cur_rest))
@@ -193,7 +208,7 @@ def _group_into_display_turns(
     for user_row, rest in groups:
         # User turn
         if user_row:
-            content, created_at = user_row
+            content, created_at, _u_extras = user_row
             text = _extract_display_text(content)
             if text:
                 turns.append({"role": "user", "content": text, "created_at": created_at})
@@ -204,8 +219,11 @@ def _group_into_display_turns(
         tool_results: Dict[str, str] = {}
         final_text = ""
         final_ts: Optional[int] = None
+        merged_extras: Dict[str, Any] = {}
 
-        for role, content, created_at in rest:
+        for role, content, created_at, extras in rest:
+            if role == "assistant" and isinstance(extras, dict):
+                merged_extras.update(extras)
             if role == "user":
                 tool_results.update(_extract_tool_results(content))
             elif role == "assistant":
@@ -216,6 +234,8 @@ def _group_into_display_turns(
                             continue
                         btype = block.get("type")
                         if btype == "thinking":
+                            if not include_thinking:
+                                continue
                             txt = block.get("thinking", "").strip()
                             if txt:
                                 steps.append({"type": "thinking", "content": txt})
@@ -239,7 +259,11 @@ def _group_into_display_turns(
         # Attach tool results to tool steps
         for step in steps:
             if step["type"] == "tool":
-                step["result"] = tool_results.get(step.get("id", ""), "")
+                tr = tool_results.get(step.get("id", ""), {})
+                if not isinstance(tr, dict):
+                    tr = {"result": tr}
+                step["result"] = tr.get("result", "")
+                step["is_error"] = tr.get("is_error", False)
 
         if steps or final_text:
             turn = {
@@ -248,6 +272,8 @@ def _group_into_display_turns(
                 "steps": steps,
                 "created_at": final_ts or (user_row[1] if user_row else 0),
             }
+            if merged_extras:
+                turn["extras"] = merged_extras
             turns.append(turn)
 
     return turns
@@ -403,13 +429,15 @@ class ConversationStore:
                         content = json.dumps(
                             msg.get("content", ""), ensure_ascii=False
                         )
+                        extras_obj = msg.get("extras") or {}
+                        extras = json.dumps(extras_obj, ensure_ascii=False) if extras_obj else ""
                         conn.execute(
                             """
                             INSERT OR IGNORE INTO messages
-                                (session_id, seq, role, content, created_at)
-                            VALUES (?, ?, ?, ?, ?)
+                                (session_id, seq, role, content, created_at, extras)
+                            VALUES (?, ?, ?, ?, ?, ?)
                             """,
-                            (session_id, next_seq, role, content, now),
+                            (session_id, next_seq, role, content, now, extras),
                         )
                         next_seq += 1
 
@@ -496,6 +524,107 @@ class ConversationStore:
             finally:
                 conn.close()
 
+    def prune_scheduled_messages(
+        self,
+        session_id: str,
+        keep_last_n: int,
+        markers: Optional[List[str]] = None,
+    ) -> int:
+        """
+        Keep at most ``keep_last_n`` scheduler-injected user/assistant pairs in
+        the session, deleting the older ones.
+
+        A scheduler-injected pair is identified by a user message whose first
+        text block starts with one of ``markers``; the immediately following
+        assistant message (next seq) is treated as its paired output.
+
+        Only scheduler-tagged messages are touched; regular user turns are
+        never deleted. Safe to call repeatedly; no-op if nothing to prune.
+
+        Args:
+            session_id: Session to prune.
+            keep_last_n: Maximum scheduler pairs to retain (must be >= 0).
+            markers: Text prefixes that identify scheduler user messages.
+                Defaults to ``["[SCHEDULED]", "Scheduled task"]`` so that
+                pairs written by older versions are also recognised.
+
+        Returns:
+            Number of message rows deleted.
+        """
+        if keep_last_n < 0:
+            keep_last_n = 0
+        if markers is None:
+            markers = ["[SCHEDULED]", "Scheduled task"]
+
+        def _matches_marker(raw_content: str) -> bool:
+            try:
+                parsed = json.loads(raw_content)
+            except Exception:
+                parsed = raw_content
+            text = _extract_display_text(parsed) if not isinstance(parsed, str) else parsed
+            if not text:
+                return False
+            return any(text.startswith(m) for m in markers)
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT seq, role, content
+                    FROM messages
+                    WHERE session_id = ?
+                    ORDER BY seq ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+
+                # Find scheduler pairs: each is (user_seq, assistant_seq?)
+                pairs: List[tuple] = []  # list of (user_seq, assistant_seq_or_None)
+                for idx, (seq, role, raw_content) in enumerate(rows):
+                    if role != "user" or not _matches_marker(raw_content):
+                        continue
+                    assistant_seq = None
+                    # Pair with the very next message if it's an assistant turn.
+                    if idx + 1 < len(rows):
+                        next_seq, next_role, _ = rows[idx + 1]
+                        if next_role == "assistant":
+                            assistant_seq = next_seq
+                    pairs.append((seq, assistant_seq))
+
+                if len(pairs) <= keep_last_n:
+                    return 0
+
+                to_delete_pairs = pairs[: len(pairs) - keep_last_n]
+                seqs_to_delete: List[int] = []
+                for user_seq, assistant_seq in to_delete_pairs:
+                    seqs_to_delete.append(user_seq)
+                    if assistant_seq is not None:
+                        seqs_to_delete.append(assistant_seq)
+
+                if not seqs_to_delete:
+                    return 0
+
+                placeholders = ",".join("?" * len(seqs_to_delete))
+                with conn:
+                    conn.execute(
+                        f"DELETE FROM messages WHERE session_id = ? AND seq IN ({placeholders})",
+                        (session_id, *seqs_to_delete),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE sessions
+                        SET msg_count = (
+                            SELECT COUNT(*) FROM messages WHERE session_id = ?
+                        )
+                        WHERE session_id = ?
+                        """,
+                        (session_id, session_id),
+                    )
+                return len(seqs_to_delete)
+            finally:
+                conn.close()
+
     def cleanup_old_sessions(self, max_age_days: Optional[int] = None) -> int:
         """
         Delete sessions that have not been active within max_age_days.
@@ -541,6 +670,55 @@ class ConversationStore:
         if deleted:
             logger.info(f"[ConversationStore] Pruned {deleted} expired sessions")
         return deleted
+
+    def attach_extras_to_last_assistant(
+        self,
+        session_id: str,
+        extras: Dict[str, Any],
+    ) -> Optional[int]:
+        """
+        Merge ``extras`` into the latest assistant message of a session.
+
+        Used by post-processing (e.g. TTS) that needs to annotate an already
+        persisted bot reply with attachments such as audio URLs.
+
+        Returns the message seq that was updated, or ``None`` if no assistant
+        message exists or the update could not be applied.
+        """
+        if not extras:
+            return None
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    """
+                    SELECT seq, extras FROM messages
+                    WHERE session_id = ? AND role = 'assistant'
+                    ORDER BY seq DESC LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if not row:
+                    return None
+                seq, raw = row
+                try:
+                    cur = json.loads(raw) if raw else {}
+                    if not isinstance(cur, dict):
+                        cur = {}
+                except Exception:
+                    cur = {}
+                cur.update(extras)
+                conn.execute(
+                    "UPDATE messages SET extras = ? WHERE session_id = ? AND seq = ?",
+                    (json.dumps(cur, ensure_ascii=False), session_id, seq),
+                )
+                conn.commit()
+                return seq
+            except Exception as e:
+                logger.warning(f"[ConversationStore] attach_extras failed: {e}")
+                return None
+            finally:
+                conn.close()
 
     def load_history_page(
         self,
@@ -589,26 +767,53 @@ class ConversationStore:
                 ).fetchone()
                 ctx_start = ctx_row[0] if ctx_row else 0
 
-                rows = conn.execute(
-                    """
-                    SELECT seq, role, content, created_at
-                    FROM messages
-                    WHERE session_id = ?
-                    ORDER BY seq ASC
-                    """,
-                    (session_id,),
-                ).fetchall()
+                # extras column is added by migration; tolerate older DBs that
+                # might miss it by falling back to a NULL literal.
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT seq, role, content, created_at, extras
+                        FROM messages
+                        WHERE session_id = ?
+                        ORDER BY seq ASC
+                        """,
+                        (session_id,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    rows = [
+                        (seq, role, content, created_at, "")
+                        for (seq, role, content, created_at) in conn.execute(
+                            """
+                            SELECT seq, role, content, created_at
+                            FROM messages
+                            WHERE session_id = ?
+                            ORDER BY seq ASC
+                            """,
+                            (session_id,),
+                        ).fetchall()
+                    ]
             finally:
                 conn.close()
 
+        # Honour the current enable_thinking switch when building display turns
+        # so that toggling it off hides previously-saved thinking blocks too.
+        try:
+            from config import conf
+            include_thinking = bool(conf().get("enable_thinking", False))
+        except Exception:
+            include_thinking = False
+
         # Strip seq for display grouping, but record max seq per visible user group
-        plain_rows = [(role, content, created_at) for _seq, role, content, created_at in rows]
-        visible = _group_into_display_turns(plain_rows)
+        plain_rows = [
+            (role, content, created_at, extras_raw)
+            for _seq, role, content, created_at, extras_raw in rows
+        ]
+        visible = _group_into_display_turns(plain_rows, include_thinking=include_thinking)
 
         # Build a mapping: find the seq of each visible user message to annotate context boundary.
         # Walk through rows to find visible user message seqs in order.
         visible_user_seqs: List[int] = []
-        for seq, role, raw_content, _ts in rows:
+        for seq, role, raw_content, _ts, _extras in rows:
             if role != "user":
                 continue
             try:
@@ -793,6 +998,18 @@ class ConversationStore:
                 logger.info("[ConversationStore] Migrated: added context_start_seq column")
             except Exception as e:
                 logger.warning(f"[ConversationStore] Migration (context_start_seq) failed: {e}")
+
+        msg_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "extras" not in msg_cols:
+            try:
+                conn.execute(_MIGRATION_ADD_MSG_EXTRAS)
+                conn.commit()
+                logger.info("[ConversationStore] Migrated: added messages.extras column")
+            except Exception as e:
+                logger.warning(f"[ConversationStore] Migration (extras) failed: {e}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path), timeout=10)
